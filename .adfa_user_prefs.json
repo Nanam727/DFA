@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "saved_at": "2026-03-09 17:12:54",
+  "rules": {
+    "school_template": "通用模板",
+    "font": "宋体",
+    "size": "三号",
+    "line_spacing": "1.5倍",
+    "margin": "普通",
+    "toc_levels": 3,
+    "reference_mode": "顺序编码制",
+    "preview_mode": "高精度模式",
+    "auto_backup_enabled": true
+  }
+}
