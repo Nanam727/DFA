@@ -25,7 +25,7 @@ if errorlevel 1 (
     %PY_CMD% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [ERROR] Dependency install failed.
-        echo         Please run fix.bat and try again.
+        echo         Please check your network, then run: pip install -r requirements.txt
         pause
         exit /b 1
     )

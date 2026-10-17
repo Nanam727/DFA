@@ -67,7 +67,6 @@ class DocxHandler:
         self.file_path: Path | None = None
         self._document: DocxDocument | None = None
         self._paragraphs: list[dict[str, Any]] = []
-        self._cleanup_undo_stack: list[bytes] = []
         self._undo_stack: list[bytes] = []
         self._redo_stack: list[bytes] = []
         self._last_section_labels: list[str] = []
@@ -85,7 +84,6 @@ class DocxHandler:
         self._document = document
         self.enforce_word_pagination_rules()
         self._paragraphs = self._collect_paragraphs(document.paragraphs)
-        self._cleanup_undo_stack.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -130,13 +128,9 @@ class DocxHandler:
             if fmt.keep_with_next is not False:
                 fmt.keep_with_next = False
                 changed += 1
-            if fmt.line_spacing_rule != WD_LINE_SPACING.MULTIPLE:
-                fmt.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
-                changed += 1
-            spacing_val = self._safe_float(fmt.line_spacing)
-            if spacing_val not in {1.25, 1.5}:
-                fmt.line_spacing = 1.25
-                changed += 1
+            # 行距属于用户格式数据，此处一律不得改写。
+            # 历史版本会把全文行距强制改成 1.25（单倍/双倍/固定值全被摧毁），
+            # 导致仅打开文档就损坏用户格式，该逻辑已移除。
             if self._set_snap_to_grid_false(para._p):
                 changed += 1
 
@@ -218,6 +212,63 @@ class DocxHandler:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
 
+    def apply_font_size_step(
+        self, indices: set[int], size_points: list[float], step: int
+    ) -> int:
+        """按每段当前字号在阶梯上独立进/退一档。
+
+        选中多种字号时不强制统一：每种字号各自放大/缩小一号，
+        保持段落间的相对大小差异。返回实际改动的 run 数。
+        """
+        if not indices or step == 0:
+            return 0
+        points = sorted({float(p) for p in size_points if float(p) > 0})
+        if not points:
+            return 0
+        doc = self._require_document()
+        self._push_undo_snapshot()
+        changed = 0
+        for idx in sorted(indices):
+            if idx < 0 or idx >= len(doc.paragraphs):
+                continue
+            para = doc.paragraphs[idx]
+            current = self._extract_font_size_pt(para)
+            if current is None:
+                # 段内未显式设置字号时按正文默认字号参与步进。
+                current = 12.0
+            target = self._step_size_on_ladder(current, points, step)
+            if target is None or abs(target - current) < 1e-6:
+                continue
+            changed += self._set_paragraph_font_size(para, target)
+        if changed:
+            self._paragraphs = self._collect_paragraphs(doc.paragraphs)
+        return changed
+
+    @staticmethod
+    def _step_size_on_ladder(
+        current: float, size_points: list[float], step: int
+    ) -> float | None:
+        """取 current 在阶梯上的下一档（step>0）或上一档（step<0）。
+
+        current 不在阶梯上（自定义字号）时，按大于/小于它的最近档进退；
+       已在两端则返回 None（不动）。
+        """
+        points = sorted(float(p) for p in size_points)
+        if step > 0:
+            for point in points:
+                if point > current + 1e-6:
+                    return point
+            return None
+        if step < 0:
+            target: float | None = None
+            for point in points:
+                if point < current - 1e-6:
+                    target = point
+                else:
+                    break
+            return target
+        return None
+
     def apply_font_name(self, indices: set[int], font_name: str) -> int:
         if not indices:
             return 0
@@ -246,8 +297,10 @@ class DocxHandler:
                 continue
             para = doc.paragraphs[idx]
             if isinstance(line_spacing, str) and line_spacing.lower() == "fixed18pt":
-                para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
-                para.paragraph_format.line_spacing = 1.5
+                # 固定 18pt 必须用 EXACTLY 精确值实现；
+                # 历史版本误用 MULTIPLE 1.5，且会被分页规则改写，双重失效。
+                para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                para.paragraph_format.line_spacing = Pt(18)
             else:
                 para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
                 para.paragraph_format.line_spacing = float(line_spacing)
@@ -360,7 +413,6 @@ class DocxHandler:
         if not indices:
             return 0
         doc = self._require_document()
-        self._push_undo_snapshot()
         align_map = {
             "left": WD_PARAGRAPH_ALIGNMENT.LEFT,
             "center": WD_PARAGRAPH_ALIGNMENT.CENTER,
@@ -371,13 +423,21 @@ class DocxHandler:
         if align_value is None:
             return 0
 
+        targets = [
+            doc.paragraphs[idx]
+            for idx in sorted(indices)
+            if 0 <= idx < len(doc.paragraphs)
+        ]
+        # 无实际变化时不压入撤销快照、不计成功——历史版本会对
+        # “已是对齐状态”的段落也推送快照并提示成功。
+        if not any(para.alignment != align_value for para in targets):
+            return 0
+        self._push_undo_snapshot()
         changed = 0
-        for idx in sorted(indices):
-            if idx < 0 or idx >= len(doc.paragraphs):
-                continue
-            para = doc.paragraphs[idx]
-            para.alignment = align_value
-            changed += 1
+        for para in targets:
+            if para.alignment != align_value:
+                para.alignment = align_value
+                changed += 1
         if changed:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
@@ -529,16 +589,27 @@ class DocxHandler:
         if mode == "smart":
             self._sync_heading_styles_from_detected_levels()
 
-        insert_idx = self._find_toc_insert_index()
+        # 先清理旧目录块，再计算插入位置。
+        # 历史版本先算索引后删旧块：索引失效，且上次生成的折页空段
+        # 位于目录标题之前、不在清理范围内，每更新一次就累积一个空白页。
         self._remove_existing_generated_toc_block()
-        has_heading = self._find_toc_heading_index() is not None
+
+        insert_idx = self._find_toc_insert_index()
+        heading_idx = self._find_toc_heading_index()
+        if heading_idx is not None:
+            # 清理上次生成时残留在目录标题之前的折页空段。
+            self._remove_stale_toc_break_paragraphs(heading_idx - 1, max_scan=2)
+
+        toc_titles = self._build_toc_titles(levels=levels)
+        if not toc_titles:
+            return {"ok": False, "message": "未识别到可用于生成目录的标题（H1/H2/H3）。"}
 
         # Ensure TOC section starts on a dedicated page.
         before_break = self._insert_paragraph_by_index(insert_idx)
         before_break.add_run().add_break(WD_BREAK.PAGE)
         insert_idx += 1
 
-        if not has_heading:
+        if heading_idx is None:
             heading_para = self._insert_paragraph_by_index(insert_idx)
             heading_para.text = "目录"
             self._apply_toc_heading_style(heading_para)
@@ -550,13 +621,11 @@ class DocxHandler:
             if existing_idx is not None:
                 insert_idx = existing_idx + 1
 
-        toc_titles = self._build_toc_titles(levels=levels)
-        if not toc_titles:
-            return {"ok": False, "message": "未识别到可用于生成目录的标题（H1/H2/H3）。"}
         inserted_count = self._insert_toc_entries(insert_idx, toc_titles)
 
         # Ensure TOC section ends and正文 starts on next page.
-        anchor_after_toc = doc.paragraphs[min(len(doc.paragraphs) - 1, insert_idx + max(0, inserted_count - 1))]
+        anchor_idx = min(len(doc.paragraphs) - 1, insert_idx + max(0, inserted_count - 1))
+        anchor_after_toc = doc.paragraphs[anchor_idx]
         after_break = self._insert_paragraph_after(anchor_after_toc)
         after_break.add_run().add_break(WD_BREAK.PAGE)
         self._paragraphs = self._collect_paragraphs(doc.paragraphs)
@@ -715,6 +784,29 @@ class DocxHandler:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
 
+    # GB/T 7714 文献类型标识推断：仅当原文缺少 [X] 标识时使用。
+    # 无法可靠判断时返回 None（保持原样），绝不默认补 [J]——
+    # 历史版本对缺标识文献一律补 [J]，把专著/学位论文/会议论文都标成期刊。
+    _REFERENCE_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+        ("D", re.compile(r"博士|硕士|学位论文|dissertation|thesis", re.I)),
+        ("C", re.compile(r"会议|论文集|研讨会|conference|proceedings|symposium|congress", re.I)),
+        ("N", re.compile(r"报纸|日报|晚报|newspaper", re.I)),
+        ("R", re.compile(r"技术报告|研究报告|报告|\breport\b", re.I)),
+        ("S", re.compile(r"标准|\bGB/T|ISO\b|\bstandard\b", re.I)),
+        ("P", re.compile(r"专利|patent", re.I)),
+        ("DB/OL", re.compile(r"数据库|database", re.I)),
+        ("EB/OL", re.compile(r"电子|网页|网站|EB/OL|https?://", re.I)),
+        ("M", re.compile(r"出版社|出版|图书|专著|\bbooks?\b|\bpress\b", re.I)),
+        ("J", re.compile(r"期刊|学报|杂志|journal", re.I)),
+    )
+
+    def _infer_reference_type(self, text: str) -> str | None:
+        """根据文献内容推断 GB/T 7714 类型标识，无法判断时返回 None。"""
+        for marker, pattern in self._REFERENCE_TYPE_PATTERNS:
+            if pattern.search(text):
+                return marker
+        return None
+
     def format_references_gbt(self, mode: str = "order") -> dict[str, object]:
         doc = self._require_document()
         self._push_undo_snapshot()
@@ -735,13 +827,18 @@ class DocxHandler:
             cleaned = self._strip_leading_reference_numbering(cleaned)
             cleaned = self._normalize_reference_punctuation(cleaned, bool(entry["is_english"]))
             cleaned = self._normalize_reference_authors(cleaned, bool(entry["is_english"]))
+            # 先规整句末标点，再把类型标识插到句末句号之前，
+            # 避免出现“句子已结束又在句末后追加 [J].”的污染形态。
+            if not cleaned.endswith("."):
+                cleaned = cleaned.rstrip("。.;；：:，,") + "."
             if not re.search(r"\[[A-Z]+(?:/[A-Z]+)?\]", cleaned):
-                cleaned = f"{cleaned} [J]"
+                # 仅在有把握时补类型标识；判断不出就保留原样，避免误注入 [J]。
+                inferred = self._infer_reference_type(cleaned)
+                if inferred:
+                    cleaned = f"{cleaned[:-1]} [{inferred}]."
             if mode_norm == "order":
                 cleaned = f"[{seq_no}] {cleaned}"
                 seq_no += 1
-            if not cleaned.endswith("."):
-                cleaned = cleaned.rstrip("。.;；：:，,") + "."
             formatted.append(cleaned)
 
         changed = self._rewrite_reference_section(bounds, formatted)
@@ -836,6 +933,50 @@ class DocxHandler:
             return []
         start_idx, end_idx = bounds
         return [k for k in range(start_idx, end_idx) if (doc.paragraphs[k].text or "").strip()]
+
+    def get_reference_section_indices(self) -> list[int]:
+        """返回“参考文献”章节的段落索引（含标题，到“致谢”或文末为止）。"""
+        doc = self._require_document()
+        start_idx: int | None = None
+        for i, para in enumerate(doc.paragraphs):
+            if self._match_section_heading(
+                para.text, {"参考文献", "reference", "references"}
+            ):
+                start_idx = i
+                break
+        if start_idx is None:
+            return []
+        end_idx = len(doc.paragraphs)
+        for j in range(start_idx + 1, len(doc.paragraphs)):
+            if self._match_section_heading(
+                doc.paragraphs[j].text, {"致谢", "acknowledgements", "acknowledgments"}
+            ):
+                end_idx = j
+                break
+        return list(range(start_idx, end_idx))
+
+    def get_acknowledgment_indices(self) -> list[int]:
+        """返回“致谢”章节的段落索引（含标题，到文末）。"""
+        doc = self._require_document()
+        start_idx: int | None = None
+        for i, para in enumerate(doc.paragraphs):
+            if self._match_section_heading(
+                para.text, {"致谢", "acknowledgements", "acknowledgments"}
+            ):
+                start_idx = i
+                break
+        if start_idx is None:
+            return []
+        return list(range(start_idx, len(doc.paragraphs)))
+
+    def _match_section_heading(self, text: str | None, names: set[str]) -> bool:
+        """判断段落文本是否匹配指定章节标题（忽略空白与末尾冒号）。"""
+        t = (text or "").strip()
+        if not t:
+            return False
+        n = re.sub(r"\s+", "", t).lower()
+        n = re.sub(r"[:：]+$", "", n)
+        return n in names
 
     def _extract_reference_entries(self, bounds: tuple[int, int]) -> list[dict[str, object]]:
         doc = self._require_document()
@@ -1041,7 +1182,6 @@ class DocxHandler:
             return 0
         doc = self._require_document()
         self._push_undo_snapshot()
-        self._push_cleanup_snapshot()
         changed = 0
         for idx in sorted(indices):
             if idx < 0 or idx >= len(doc.paragraphs):
@@ -1052,9 +1192,7 @@ class DocxHandler:
             if updated != original:
                 self._replace_paragraph_text(para, updated)
                 changed += 1
-        if not changed:
-            self._pop_cleanup_snapshot()
-        else:
+        if changed:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
 
@@ -1063,7 +1201,6 @@ class DocxHandler:
             return 0
         doc = self._require_document()
         self._push_undo_snapshot()
-        self._push_cleanup_snapshot()
         changed = 0
         for idx in sorted(indices):
             if idx < 0 or idx >= len(doc.paragraphs):
@@ -1082,9 +1219,7 @@ class DocxHandler:
             if updated != original:
                 self._replace_paragraph_text(para, updated)
                 changed += 1
-        if not changed:
-            self._pop_cleanup_snapshot()
-        else:
+        if changed:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
 
@@ -1094,7 +1229,6 @@ class DocxHandler:
             return 0
         doc = self._require_document()
         self._push_undo_snapshot()
-        self._push_cleanup_snapshot()
         changed = 0
         for idx in sorted(indices):
             if idx < 0 or idx >= len(doc.paragraphs):
@@ -1105,16 +1239,13 @@ class DocxHandler:
             if updated != original:
                 self._replace_paragraph_text(para, updated)
                 changed += 1
-        if not changed:
-            self._pop_cleanup_snapshot()
-        else:
+        if changed:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return changed
 
     def clean_remove_empty_paragraphs(self) -> int:
         doc = self._require_document()
         self._push_undo_snapshot()
-        self._push_cleanup_snapshot()
         removed = 0
         for para in list(doc.paragraphs):
             if (para.text or "").strip():
@@ -1122,23 +1253,13 @@ class DocxHandler:
             p_element = para._element
             p_element.getparent().remove(p_element)
             removed += 1
-        if not removed:
-            self._pop_cleanup_snapshot()
-        else:
+        if removed:
             self._paragraphs = self._collect_paragraphs(doc.paragraphs)
         return removed
 
     def count_empty_paragraphs(self) -> int:
         doc = self._require_document()
         return sum(1 for para in doc.paragraphs if not (para.text or "").strip())
-
-    def undo_last_cleanup(self) -> bool:
-        if not self._cleanup_undo_stack:
-            return False
-        last_snapshot = self._cleanup_undo_stack.pop()
-        self._document = Document(BytesIO(last_snapshot))
-        self._paragraphs = self._collect_paragraphs(self._document.paragraphs)
-        return True
 
     def undo_last_action(self) -> bool:
         doc = self._require_document()
@@ -1664,6 +1785,28 @@ class DocxHandler:
             if parent is not None:
                 parent.remove(para._element)
 
+    def _remove_stale_toc_break_paragraphs(self, start_idx: int, max_scan: int = 2) -> int:
+        """移除上次生成目录时遗留的折页空段（无文字、仅含分页符的段落）。"""
+        doc = self._require_document()
+        removed = 0
+        idx = start_idx
+        while idx >= 0 and removed < max_scan and idx < len(doc.paragraphs):
+            para = doc.paragraphs[idx]
+            if (para.text or "").strip() or not self._paragraph_has_page_break(para):
+                break
+            parent = para._element.getparent()
+            if parent is not None:
+                parent.remove(para._element)
+            removed += 1
+            idx -= 1
+        return removed
+
+    def _paragraph_has_page_break(self, para: Paragraph) -> bool:
+        for node in para._p.xpath(".//w:br"):
+            if node.get(qn("w:type")) == "page":
+                return True
+        return False
+
     def _insert_paragraph_by_index(self, index: int) -> Paragraph:
         doc = self._require_document()
         if not doc.paragraphs:
@@ -2158,19 +2301,6 @@ class DocxHandler:
             escaped = rf"\b{escaped}\b"
         flags = 0 if case_sensitive else re.IGNORECASE
         return re.compile(escaped, flags)
-
-    def _push_cleanup_snapshot(self) -> None:
-        if self._undo_stack:
-            self._cleanup_undo_stack.append(self._undo_stack[-1])
-            return
-        doc = self._require_document()
-        bio = BytesIO()
-        doc.save(bio)
-        self._cleanup_undo_stack.append(bio.getvalue())
-
-    def _pop_cleanup_snapshot(self) -> None:
-        if self._cleanup_undo_stack:
-            self._cleanup_undo_stack.pop()
 
     def _push_undo_snapshot(self) -> None:
         doc = self._require_document()
